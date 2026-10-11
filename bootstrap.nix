@@ -48,6 +48,8 @@
   fileSystems."/boot/efi" = {
     device = "/dev/disk/by-uuid/876F-1C6F";
     fsType = "vfat";
+    # 与真机 nixos-generate-config 的输出一致（vfat 默认权限）
+    options = [ "fmask=0022" "dmask=0022" ];
   };
 
   # AWS Nitro（NVMe + ENA）
@@ -65,6 +67,9 @@
     "random.trust_cpu=on"
     "console=ttyS0,115200n8"
   ];
+
+  # 平台（真机 nixos-generate-config 亦会写上，这里补上保持一致）
+  nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux";
 
   networking.hostName = "lightsail";
   networking.useDHCP = lib.mkDefault true;

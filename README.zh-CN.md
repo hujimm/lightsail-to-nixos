@@ -221,6 +221,7 @@ boot.initrd.systemd.enable = false;
   fileSystems."/boot/efi" = {
     device = "/dev/disk/by-uuid/876F-1C6F";
     fsType = "vfat";
+    options = [ "fmask=0022" "dmask=0022" ];
   };
 
   # AWS Nitro（NVMe + ENA）
@@ -233,6 +234,8 @@ boot.initrd.systemd.enable = false;
     "random.trust_cpu=on"
     "console=ttyS0,115200n8"
   ];
+
+  nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux";
 
   networking.hostName = "lightsail";
   networking.useDHCP = lib.mkDefault true;
