@@ -1,24 +1,14 @@
-# AWS Lightsail 就地安装配置（供 nixos-infect 使用）。
+# 就地转换用的单文件配置，喂给 nixos-infect。
 #
-# 为什么不用 nixos-anywhere / disko：Lightsail 是 Nitro 平台，kexec 后 ENA/NVMe
-# 设备不重新初始化（nixos-anywhere issue #139），会失联；且 Lightsail 不支持导入
-# 自定义镜像。故采用 nixos-infect 的 lustrate「就地替换」（普通重启，设备正常复位）。
+# 必须配合 NIX_CHANNEL=nixos-26.05：lustrate 只在 bash 版 stage-1 里实现，
+# 26.11 起 scripted initrd 被删，这个选项会直接 assertion 失败。
 #
-# 为什么自带配置：nixos-infect 的 lightsail 预设只 import amazon-image.nix，
-# 而 ec2.efi 默认值 = isAarch64（x86_64 上为 false），会装 BIOS GRUB —— 对这台
-# UEFI 机器是致命的。这里显式写 UEFI：ESP 挂 /boot/efi、可移动回退路径，
-# 与 nixos-infect 的 EFI 收尾（它把 ESP 挂到 /boot/efi）一致，也与当前 Ubuntu 布局一致。
-#
-# 本文件同时被 hosts/lightsail/default.nix 作为 flake host 复用，所以自包含
-# （不依赖 flake inputs、不使用 disko）。
-{
-  lib,
-  pkgs,
-  ...
-}:
+# 不用 nixos-infect 自带的 lightsail 预设：它 import amazon-image.nix，
+# 而 ec2.efi 在 x86_64 上是 false，会去装 BIOS GRUB。
+{ lib, ... }:
 
 {
-  # 引导：UEFI + 可移动回退路径（EFI/BOOT/BOOTX64.EFI）；ESP 在 /boot/efi，内核放独立 /boot
+  # UEFI，写到可移动回退路径；NVRAM 不用手动改，旧启动项失效时固件会回退到这里
   boot.loader.grub = {
     enable = true;
     efiSupport = true;
@@ -27,32 +17,24 @@
   };
   boot.loader.efi.efiSysMountPoint = "/boot/efi";
 
-  # 【关键】必须关闭 systemd-initrd！
-  # NixOS 26.05 起 boot.initrd.systemd.enable 默认为 true，而 nixos-infect 依赖的
-  # NIXOS_LUSTRATE（首次启动把旧系统整体挪到 /old-root）只在【bash 版 stage-1】
-  # （stage-1-init.sh 的 lustrateRoot）里实现，systemd-initrd 完全没有这段逻辑。
-  # 若不关闭，首次启动不会挪走旧 Ubuntu 的 /etc、/usr，导致 Ubuntu 的 systemd
-  # 单元（systemd-networkd/resolved/dbus 等）泄漏进来、网络起不来——这正是
-  # Lightsail/EC2 上"装完重启即失联"的真因（已在 EC2 串口日志中确认）。
+  # 不关的话旧系统的 /etc、/usr 不会挪进 /old-root，networkd/resolved 泄漏进来导致失联
   boot.initrd.systemd.enable = false;
 
-  # 磁盘按 UUID 引用（nixos-infect 会把根分区 relabel 成 nixos，UUID 不变）
+  # UUID 用 blkid 读，同 AMI 的实例一致
   fileSystems."/" = {
-    device = "/dev/disk/by-uuid/d662a37e-da8d-4720-94ff-f588450178c0";
+    device = "/dev/disk/by-uuid/<ROOT-UUID>";
     fsType = "ext4";
   };
   fileSystems."/boot" = {
-    device = "/dev/disk/by-uuid/71a1f8dc-6e9a-4e94-bf6b-9b1ea9866c4b";
+    device = "/dev/disk/by-uuid/<BOOT-UUID>";
     fsType = "ext4";
   };
   fileSystems."/boot/efi" = {
-    device = "/dev/disk/by-uuid/876F-1C6F";
+    device = "/dev/disk/by-uuid/<ESP-UUID>";
     fsType = "vfat";
-    # 与真机 nixos-generate-config 的输出一致（vfat 默认权限）
     options = [ "fmask=0022" "dmask=0022" ];
   };
 
-  # AWS Nitro（NVMe + ENA）
   boot.initrd.availableKernelModules = [
     "nvme"
     "ena"
@@ -68,12 +50,10 @@
     "console=ttyS0,115200n8"
   ];
 
-  # 平台（真机 nixos-generate-config 亦会写上，这里补上保持一致）
   nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux";
 
   networking.hostName = "lightsail";
   networking.useDHCP = lib.mkDefault true;
-  time.timeZone = "Asia/Shanghai";
 
   services.openssh = {
     enable = true;
@@ -84,22 +64,19 @@
     };
   };
 
-  # 复用 AWS 密钥对（私钥 /home/orion/下载/aws-nix.pem）
   users.users.root.openssh.authorizedKeys.keys = [
-    "ssh-rsa AAAA...<YOUR_SSH_PUBLIC_KEY>"
+    "<YOUR_SSH_PUBLIC_KEY>"
   ];
 
-  # Lightsail 浏览器 SSH 默认以 ubuntu 用户登录；建一个同名用户当"健康探针"，
-  # 这样控制台的 Connect using SSH 能真连进来（NixOS 默认没有 ubuntu 用户）。
+  # 控制台 Connect 默认以 ubuntu 登录，留个同名用户当探针
   users.users.ubuntu = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
     openssh.authorizedKeys.keys = [
-      "ssh-rsa AAAA...<YOUR_SSH_PUBLIC_KEY>"
+      "<YOUR_SSH_PUBLIC_KEY>"
     ];
   };
 
-  # 内存 ~1.9GiB，加 2GiB swapfile（与 nixos-infect 的 /tmp 临时 swap 不冲突）
   swapDevices = [
     {
       device = "/var/swapfile";
@@ -107,29 +84,15 @@
     }
   ];
 
-  environment.systemPackages = with pkgs; [
-    git
-    vim
-  ];
-
   nix.settings = {
     experimental-features = [
       "nix-command"
       "flakes"
     ];
-    substituters = [
-      "https://cache.nixos.org"
-      "https://nix-community.cachix.org"
-    ];
-    trusted-public-keys = [
-      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
-    ];
     trusted-users = [
       "root"
       "@wheel"
     ];
-    auto-optimise-store = false;
   };
 
   nix.gc = {
@@ -137,7 +100,6 @@
     dates = "weekly";
     options = "--delete-older-than 14d";
   };
-  nix.optimise.automatic = true;
 
   system.stateVersion = "26.05";
 }

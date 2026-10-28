@@ -1,436 +1,112 @@
-**English** | [中文](./README.zh-CN.md)
+# 把 AWS Lightsail 就地转成 NixOS
 
-# Converting AWS Lightsail to NixOS in place — a field report
+不重装、不导入镜像，在原 Ubuntu 上就地换成 NixOS。
 
-> Written from a real deployment in 2026-10. Goal: turn an **AWS Lightsail** instance
-> (Sydney, `t3.small`, UEFI) from Ubuntu into NixOS 26.05 **in place**, without
-> reinstalling the machine.
-> This documents the **real hardware, the real parameters, the dead ends, and the fix** —
-> not a "just follow X" second-hand tutorial.
->
-> The fix is one line: **add `boot.initrd.systemd.enable = false;` to the config.** See §6.
+一句话结论：**注入这一遍必须用 `nixos-26.05`**。`nixos-infect` 靠 `lustrate` 把旧系统挪进
+`/old-root`，而这段逻辑只实现在 bash 版 stage-1 里；26.11 起 scripted initrd 被删除，
+`boot.initrd.systemd.enable` 直接变成一条 assertion 错误，脚本走不到最后。装好之后想切哪个
+channel 都行，与这一点无关。
 
----
+## 平台事实
 
-## TL;DR
-
-- A Lightsail instance is just an **EC2 `t3.small` (Nitro)** with **UEFI** boot and **in-tree**
-  `nvme` + `ena` drivers — no exotic hardware.
-- It **cannot** use `nixos-anywhere`/`disko`: on Nitro, ENA/NVMe are not re-initialized after
-  `kexec` ([nixos-anywhere#139](https://github.com/nixos-anywhere/nixos-anywhere/issues/139)),
-  and Lightsail does not allow importing custom images. The only path is **`nixos-infect`'s
-  in-place "lustrate"** (takes effect on the next ordinary reboot).
-- Symptom: **install finishes with `EXIT=0`, everything on disk is correct, yet after reboot SSH
-  is permanently unreachable.** Lightsail has no serial console, so you cannot even tell whether
-  it booted.
-- **Root cause**: since NixOS 26.05, **`boot.initrd.systemd.enable` defaults to `true`**, while the
-  `NIXOS_LUSTRATE` step that `nixos-infect` relies on (moving the old system to `/old-root` on first
-  boot) is **only implemented in the bash stage-1** (`lustrateRoot`). systemd-initrd has none of it.
-  So the old Ubuntu `/etc` and `/usr` stay in place → Ubuntu's systemd units
-  (`systemd-networkd`/`systemd-resolved`/`dbus`…) leak into NixOS → **networking never comes up** →
-  SSH is dead.
-- **Fix**: set **`boot.initrd.systemd.enable = false;`** in the NixOS config so the bash stage-1
-  runs and lustrate actually happens.
-
----
-
-## 1. Understand the platform first — don't guess
-
-Read it straight off the (working) Ubuntu instance — "everything is a file":
+Lightsail 就是标准 Nitro EC2，从能 SSH 的 Ubuntu 里直接读：
 
 ```console
-$ sudo dmidecode -s system-product-name
-t3.small
+$ sudo dmidecode -s system-product-name     # t3.small
 $ [ -d /sys/firmware/efi ] && echo UEFI
-UEFI
-$ lspci -nnk | grep -A3 -E "NVMe EBS|Elastic Network"
-00:04.0 Non-Volatile memory controller: Amazon.com, Inc. NVMe EBS Controller [1d0f:8061]
-        Kernel driver in use: nvme
-00:05.0 Ethernet controller: Amazon.com, Inc. Elastic Network Adapter (ENA) [1d0f:ec20]
-        Kernel driver in use: ena
-$ ethtool -i ens5 | head -1
-driver: ena            # in-tree kernel module
+$ sudo lspci -nnk | grep -A2 "Non-Volatile memory"   # nvme
+$ ethtool -i ens5 | head -1                 # driver: ena
 ```
 
-Key points:
-- **The NIC is Amazon ENA and the disk is EBS NVMe — both driven by in-tree kernel modules.**
-  There is no such thing as "a missing ENA driver" (I guessed in that direction early on; it was wrong).
-- `t3.small` means Lightsail is a standard Nitro EC2 instance — officially supported by NixOS.
+`nvme` 和 `ena` 都是内核自带驱动，不存在"缺 ENA 驱动"这回事。
 
-### Disk layout (Lightsail 2GB plan, 60GB disk)
+Ubuntu 24.04 AMI 的分区（Lightsail 各套餐相同，只是容量不同）：
 
 ```
-nvme0n1        60G
-├─nvme0n1p1    59G ext4   LABEL=cloudimg-rootfs   UUID=d662a37e-da8d-4720-94ff-f588450178c0   /        ← root
-├─nvme0n1p14    4M
-├─nvme0n1p15  106M vfat   LABEL=UEFI              UUID=876F-1C6F                              /boot/efi ← ESP
-└─nvme0n1p16  913M ext4   LABEL=BOOT              UUID=71a1f8dc-6e9a-4e94-bf6b-9b1ea9866c4b   /boot
+nvme0n1
+├─p1    ext4  /              LABEL=cloudimg-rootfs
+├─p14    4M
+├─p15  vfat  /boot/efi       LABEL=UEFI           ← ESP
+└─p16  ext4  /boot           LABEL=BOOT           ← 独立 /boot，913M
 ```
 
-- Root PARTUUID = `047e559f-5363-4375-91d2-6aa49f34bcf7`
-- Ubuntu's `fstab` uses `LABEL=…`; its kernel cmdline uses `root=PARTUUID=…`:
-  `root=PARTUUID=047e559f-… ro console=tty1 console=ttyS0 nvme_core.io_timeout=4294967295 panic=-1`
-- Ubuntu version: **Ubuntu 24.04.4 LTS (Noble Numbat)**, kernel **`7.0.0-1012-aws`**
-- Firmware boot entries (`efibootmgr`):
-  ```
-  Boot0002* Ubuntu  HD(15,GPT,80149193-fbe8-43ee-8a33-5fa70634c9e2,…)/File(\EFI\ubuntu\shimx64.efi)
-  Boot0001* UEFI Amazon Elastic Block Store … {auto_created_boot_option}
-  ```
+同一 AMI 重建实例时文件系统 UUID 不变，公网 IP 和 host key 会变。
 
-> **Recreating an instance from the same AMI keeps the filesystem UUIDs** (they are baked into the
-> AMI snapshot); but the **public IP may change**, and the SSH host key changes — clear it with
-> `ssh-keygen -R <IP>` before reconnecting.
+## 为什么不用 nixos-anywhere / disko
 
----
+- Nitro 上 `kexec` 之后 ENA/NVMe 不会重新初始化，nixos-anywhere 直接失联
+  （[issue #139](https://github.com/nixos-anywhere/nixos-anywhere/issues/139)）。
+- Lightsail 不支持导入自定义镜像，也就没法直接用 NixOS 官方 AMI。
 
-## 2. Why not nixos-anywhere / disko
+只剩 `nixos-infect` 的 lustrate：在旧系统里装好 NixOS、写好标记，**下次普通重启**时由
+stage-1 把旧系统整体挪走。
 
-- Lightsail is **Nitro**: after `kexec`, ENA/NVMe devices are not re-initialized, so nixos-anywhere
-  loses the machine (issue #139).
-- Lightsail **does not allow importing custom images**, so you can't just use an official NixOS AMI
-  the way you can on EC2.
-- Conclusion: use [`nixos-infect`](https://github.com/elitak/nixos-infect)'s **lustrate** — install
-  NixOS on the running system, write `/etc/NIXOS_LUSTRATE`, and let NixOS's stage-1 move the old
-  system aside on the **next ordinary reboot** (devices reset normally).
+## 唯一容易踩的地方
 
-### Do not use the `PROVIDER=lightsail` preset config as-is
-
-nixos-infect's lightsail preset just `import`s `amazon-image.nix`, where `ec2.efi` defaults to
-`isAarch64` — **`false` on x86_64, so it installs BIOS GRUB**, which is fatal for this UEFI machine.
-So supply your **own config** (see §8) and use `PROVIDER=lightsail` only to trigger "relabel the root
-partition to `nixos`".
-
----
-
-## 3. Symptom: install succeeds, reboot loses the machine
-
-```console
-$ sudo env PROVIDER=lightsail NIX_CHANNEL=nixos-26.05 NO_REBOOT=1 bash -x ./nixos-infect
-...
-+ /nix/var/nix/profiles/system/bin/switch-to-configuration boot
-installing the GRUB 2 boot loader into /boot/efi...
-Installation finished. No error reported.
-EXIT=0
-```
-
-`EXIT=0`, and every check passed:
-- the ESP holds NixOS's `\EFI\BOOT\BOOTX64.EFI`;
-- `/boot/kernels/` holds NixOS's `bzImage` and `initrd`;
-- the root partition label was changed to `nixos`.
-
-**Then reboot → SSH is forever `Connection timed out`.** After reboot, CPU shows a brief boot spike
-then flatlines. Lightsail's browser SSH reports a generic error.
-
----
-
-## 4. Why the cause stayed invisible
-
-- **Lightsail gives you no serial console.** "Kernel never booted" and "booted but no network" look
-  **identical** on Lightsail (CPU spike then zero), so you **cannot tell them apart**.
-- From China, Sydney is blocked; through the local proxy (Clash TUN) the TCP connection looks
-  "established" and then stalls at the banner exchange — **that signal is useless**.
-
-Conclusion: you **must** get a machine where you can read the boot log.
-
----
-
-## 5. Borrowing EC2 as "eyes"
-
-Launch an EC2 instance in the **same region (Sydney), same type (`t3.small`), same Ubuntu (24.04)** —
-its disk layout is **identical** to Lightsail (p1 root + p15 ESP + p16 /boot, UEFI), but it has
-**`Get system log` (serial) + `Get instance screenshot`**.
-
-Run the same nixos-infect (without touching NVRAM), reboot, and read the serial log — **the truth at last**:
-
-```
-Booting initrd of NixOS 26.05 (Yarara) (Initrd).
-Found device Amazon Elastic Block Store nixos.
-Mounted /sysroot.
-Starting NixOS Activation... Finished NixOS Activation.
-Welcome to NixOS 26.05 (Yarara)!
-...
-[  OK  ] Reached target Multi-User System.
-[  OK  ] Listening on OpenBSD Secure Shell server socket.
-
-[FAILED] Failed to start Network Configuration.        ← systemd-networkd
-[FAILED] Failed to start Network Name Resolution.       ← systemd-resolved
-[FAILED] Failed to start D-Bus System Message Bus.
-[FAILED] Failed to start … (snapd / apport / chrony / rsyslog / networkd-dispatcher / …)
-```
-
-Two crucial facts:
-1. **NixOS actually booted fully** (kernel, initrd, root mount, switch root, multi-user all OK) — so
-   "the install on disk" was never the problem.
-2. **All the failing units are Ubuntu's** (`snapd`/`apport`/`chrony`/`rsyslog`/`networkd-dispatcher`…),
-   and the network units (`systemd-networkd`/`resolved`) failed too → **no IP → no SSH**.
-
-**Old Ubuntu systemd units leaked in** — that's the clue.
-
----
-
-## 6. Root cause (verifiable in the source)
-
-Checking the nixpkgs source:
-
-- The definition of `boot.initrd.systemd.enable` (`nixos/modules/system/boot/systemd/initrd.nix`):
-  ```nix
-  enable = mkEnableOption "systemd in initrd" // {
-    default = true;   # ← default since NixOS 26.05
-    ...
-  ```
-- But the `NIXOS_LUSTRATE` handler **`lustrateRoot`** exists only in the **bash stage-1**
-  (`nixos/modules/system/boot/stage-1-init.sh`):
-  ```sh
-  [ "$mountPoint" == "/" ] && [ -f "/mnt-root/etc/NIXOS_LUSTRATE" ] && lustrateRoot "/mnt-root"
-  ```
-  The entire `nixos/modules/system/boot/systemd/` directory contains **no `LUSTRATE`/`lustrate` at all**.
-
-**Full causal chain:**
-```
-NixOS 26.05 defaults to systemd-initrd
-   → first boot no longer runs lustrateRoot in stage-1
-   → old Ubuntu /etc and /usr are never moved to /old-root
-   → Ubuntu's systemd units leak into NixOS
-   → systemd-networkd/resolved etc. fail on conflict
-   → no IP → no SSH
-```
-This also explains the community adage "**26.05 images don't come up, 25.11 works**" — 25.11 didn't
-default to systemd-initrd yet.
-
-(Corroborating evidence: on the working install, nixos-infect prints
-`evaluation warning: Scripted initrd is deprecated and scheduled for removal in 26.11`, and the
-serial log shows `<<< NixOS is now lustrating the root filesystem (cruft goes to /old-root) >>>`.
-On the failing boots, that lustrate line was **absent**.)
-
----
-
-## 7. The fix: one line
-
-Add to the NixOS config:
+配置里必须有：
 
 ```nix
 boot.initrd.systemd.enable = false;
 ```
 
-Disabling systemd-initrd returns to the bash stage-1, `lustrateRoot` runs, the old system is archived
-to `/old-root`, NixOS gets a clean `/etc`, and networking works again.
+不写的症状是安装全程 `EXIT=0`、盘上一切正确、重启后却永远连不上。原因是 26.05 起
+systemd-initrd 成为默认，而 `lustrateRoot` 只存在于 `stage-1-init.sh`，systemd-initrd
+里没有对应实现——旧 Ubuntu 的 `/etc`、`/usr` 留在根上，`systemd-networkd`/`resolved`
+等单元泄漏进来，网络起不来。串口里能直接看到这些 Ubuntu 单元报 `[FAILED]`。
 
----
-
-## 8. Full config (`bootstrap.nix`)
-
-Self-contained: explicit UEFI, ESP mounted at `/boot/efi`, filesystems referenced by UUID. This is
-also the content of `hosts/lightsail/bootstrap.nix` in the author's flake.
-
-```nix
-# AWS Lightsail in-place install config (used by nixos-infect).
-{ lib, pkgs, ... }:
-
-{
-  # Boot: UEFI + removable fallback path (EFI/BOOT/BOOTX64.EFI); ESP at /boot/efi, kernel on a separate /boot
-  boot.loader.grub = {
-    enable = true;
-    efiSupport = true;
-    efiInstallAsRemovable = true;
-    device = "nodev";
-  };
-  boot.loader.efi.efiSysMountPoint = "/boot/efi";
-
-  # [CRITICAL] systemd-initrd MUST be off!
-  # Since NixOS 26.05 boot.initrd.systemd.enable defaults to true, but the NIXOS_LUSTRATE
-  # step nixos-infect relies on (moving the whole old system to /old-root on first boot)
-  # exists ONLY in the bash stage-1 (stage-1-init.sh's lustrateRoot); systemd-initrd has
-  # none of it. If left on, the first boot never moves the old Ubuntu /etc and /usr aside,
-  # Ubuntu's systemd units (systemd-networkd/resolved/dbus …) leak in, and networking dies.
-  boot.initrd.systemd.enable = false;
-
-  # Refer to disks by UUID (nixos-infect relabels the root partition to "nixos"; UUID is unchanged)
-  fileSystems."/" = {
-    device = "/dev/disk/by-uuid/d662a37e-da8d-4720-94ff-f588450178c0";
-    fsType = "ext4";
-  };
-  fileSystems."/boot" = {
-    device = "/dev/disk/by-uuid/71a1f8dc-6e9a-4e94-bf6b-9b1ea9866c4b";
-    fsType = "ext4";
-  };
-  fileSystems."/boot/efi" = {
-    device = "/dev/disk/by-uuid/876F-1C6F";
-    fsType = "vfat";
-    options = [ "fmask=0022" "dmask=0022" ];
-  };
-
-  # AWS Nitro (NVMe + ENA)
-  boot.initrd.availableKernelModules = [
-    "nvme" "ena" "virtio_pci" "virtio_blk" "sd_mod" "uas"
-  ];
-  boot.initrd.kernelModules = [ "nvme" ];
-  boot.kernelParams = [
-    "nvme_core.io_timeout=4294967295"
-    "random.trust_cpu=on"
-    "console=ttyS0,115200n8"
-  ];
-
-  nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux";
-
-  networking.hostName = "lightsail";
-  networking.useDHCP = lib.mkDefault true;
-  time.timeZone = "Asia/Shanghai";
-
-  services.openssh = {
-    enable = true;
-    settings = {
-      PermitRootLogin = "prohibit-password";
-      PasswordAuthentication = false;
-      KbdInteractiveAuthentication = false;
-    };
-  };
-
-  # Reuse your AWS key pair (put the public key here; keep the private key local)
-  users.users.root.openssh.authorizedKeys.keys = [
-    "ssh-ed25519 AAAA...<YOUR_SSH_PUBLIC_KEY>"
-  ];
-  # Lightsail's browser SSH logs in as user "ubuntu"; create one as a health probe
-  users.users.ubuntu = {
-    isNormalUser = true;
-    extraGroups = [ "wheel" ];
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAA...<YOUR_SSH_PUBLIC_KEY>"
-    ];
-  };
-
-  # ~1.9GiB RAM → add a 2GiB swapfile
-  swapDevices = [ { device = "/var/swapfile"; size = 2048; } ];
-
-  environment.systemPackages = with pkgs; [ git vim ];
-
-  nix.settings = {
-    experimental-features = [ "nix-command" "flakes" ];
-    substituters = [
-      "https://cache.nixos.org"
-      "https://nix-community.cachix.org"
-    ];
-    trusted-public-keys = [
-      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
-    ];
-    trusted-users = [ "root" "@wheel" ];
-    auto-optimise-store = false;
-  };
-
-  nix.gc = { automatic = true; dates = "weekly"; options = "--delete-older-than 14d"; };
-  nix.optimise.automatic = true;
-
-  system.stateVersion = "26.05";
-}
-```
-
-> Replace the three UUIDs with what `blkid` reports on your machine (usually identical for the same
-> AMI, but **always verify**). The repo ships the same file as [`bootstrap.nix`](./bootstrap.nix).
-
----
-
-## 9. Reproducible steps
-
-Assumes a **fresh Ubuntu** instance, already reachable over SSH, with the matching private key locally.
+## 步骤
 
 ```bash
-IP=<your-public-ip>; KEY=<your-private-key>; U=ubuntu   # fresh Ubuntu uses the ubuntu user
+IP=<公网 IP>; KEY=<私钥>; U=ubuntu
 
-# 0) Clear a stale host key locally (if the instance was recreated)
-ssh-keygen -R "$IP"
+# 0.5 GB 机型（t3.nano）先加 4 GB swap：脚本自带 1 GB，而求值阶段 swap 峰值用到 800 MB 上下
+ssh -i $KEY $U@$IP 'sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile \
+  && sudo mkswap /swapfile && sudo swapon /swapfile'
 
-# 1) Back up the original ESP as a fallback
-ssh -i "$KEY" $U@$IP 'sudo mkdir -p /root/backup && \
-  sudo tar czf /root/backup/esp-ubuntu.tgz -C /boot/efi . && \
-  sudo efibootmgr -v | sudo tee /root/backup/efibootmgr.before.txt >/dev/null'
+# 放配置：改掉三个 UUID 和公钥
+ssh -i $KEY $U@$IP 'sudo mkdir -p /etc/nixos'
+ssh -i $KEY $U@$IP 'sudo tee /etc/nixos/configuration.nix >/dev/null' < bootstrap.nix
 
-# 2) Drop in the config
-ssh -i "$KEY" $U@$IP 'sudo mkdir -p /etc/nixos && sudo tee /etc/nixos/configuration.nix >/dev/null' < bootstrap.nix
+# 注入。NO_SWAP=1 用我们自己加的 swap；NO_REBOOT=1 先看清楚日志再重启
+ssh -i $KEY $U@$IP 'sudo env PROVIDER=lightsail NO_SWAP=1 NO_REBOOT=1 \
+  NIX_CHANNEL=nixos-26.05 bash -x \
+  <(curl -fsSL https://raw.githubusercontent.com/elitak/nixos-infect/master/nixos-infect)'
 
-# 3) Clone nixos-infect
-ssh -i "$KEY" $U@$IP 'cd ~ && rm -rf nixos-infect && \
-  git clone --depth 1 https://github.com/elitak/nixos-infect nixos-infect'
-
-# 4) In-place install (NO_REBOOT=1: don't reboot yet, so you can inspect)
-ssh -i "$KEY" $U@$IP 'sudo env PROVIDER=lightsail NIX_CHANNEL=nixos-26.05 NO_REBOOT=1 \
-  bash ~/nixos-infect/nixos-infect'
-
-# 5) Reboot once everything checks out
-ssh -i "$KEY" $U@$IP 'sudo systemctl reboot'
+# 日志末尾出现 "The new configuration is ..." 后再重启
+ssh -i $KEY $U@$IP 'sudo systemctl reboot'
 ```
 
-After reboot, log in as **root** (via the public key in the config):
+重启后用 root 登录，然后清掉转换留下的一次性东西：
 
 ```bash
-ssh -i "$KEY" root@$IP 'nixos-version'
+rm -rf /old-root
+nix-env --delete-generations old --profile /nix/var/nix/profiles/system
+nix-collect-garbage -d
 ```
 
-Day-to-day rebuilds (from the local flake repo):
+之后这台机器就是普通 NixOS，日常重建照旧：
 
 ```bash
-nixos-rebuild switch --flake .#lightsail --target-host lightsail
+nixos-rebuild switch --flake .#<host> --target-host root@$IP
 ```
 
----
+`PROVIDER=lightsail` 只用来让脚本把根分区 label 改成 `nixos`，配置走自己的
+`bootstrap.nix`——脚本自带的 lightsail 预设会 `import amazon-image.nix`，而 `ec2.efi`
+在 x86_64 上是 `false`，会去装 BIOS GRUB。
 
-## 10. Verification (after the fix)
+## 没有串口时怎么看到真相
 
-Identical on both Lightsail and EC2:
+Lightsail 不提供串口，"内核没起来"和"起来了但没网"在外部表现完全一样。排查办法是同区域、
+同机型再开一台 EC2，跑同样的步骤，用 `Get system log` 看串口——成功时能看到
+`<<< NixOS is now lustrating the root filesystem >>>`，失败时这句不出现。看完就 terminate，
+成本几毛钱。
 
-```
-nixos-version : 26.05.11576.7c8764b7c7b0 (Yarara)     kernel: 6.18.55
-systemctl --failed : 0 loaded units listed
-ip -4 -br a   : ens5  UP  172.26.1.140/20
-curl cache.nixos.org : -> 200
-lsblk         : p1 59G ext4 nixos /   p15 106M vfat UEFI /boot/efi   p16 913M ext4 BOOT /boot
-free -h       : Swap 2.0Gi
-ls /old-root  : bin etc usr var snap …   ← the old Ubuntu, fully archived
-```
+## 文件
 
-The serial log shows the decisive step:
+[`bootstrap.nix`](./bootstrap.nix)：注入用的单文件配置，占位符换成自己的值。
 
-```
-<<< NixOS is now lustrating the root filesystem (cruft goes to /old-root) >>>
-Moving impurities out of the way: '/mnt-root/etc' -> '/mnt-root/old-root.tmp/etc' ...
-```
+## 参考
 
----
-
-## 11. Gotchas
-
-1. **Do not remove `boot.initrd.systemd.enable = false;`.** It is the crux of nixos-infect-style
-   in-place installs on 26.05.
-2. **The 26.11 landmine**: the log warns `Scripted initrd is deprecated and scheduled for removal in
-   26.11`. Already-installed systems are unaffected, but if 26.11 really removes the bash initrd,
-   nixos-infect-style in-place installs break again — you'd need another approach (official AMI or
-   another migration path).
-3. **You do not need to touch NVRAM.** I once manually added a boot entry pointing at
-   `\EFI\BOOT\BOOTX64.EFI` as "double insurance"; later, on EC2, I verified that **even with a stale
-   `Boot0002` still pointing at the deleted `\EFI\ubuntu\shimx64.efi`, the firmware falls back to the
-   removable path `\EFI\BOOT\BOOTX64.EFI` on its own**. So the final procedure leaves NVRAM alone.
-4. **`--target-host` and the GC root**: `nixos-rebuild --target-host` builds locally and copies to the
-   remote; the **GC root lives on the remote**, so the local closure is unrooted and may be collected
-   by a local nightly GC, forcing rebuilds. Keep a local root:
-   ```bash
-   nix build .#nixosConfigurations.lightsail.config.system.build.toplevel -o ~/nixos-lightsail
-   ```
-5. **Lightsail has no serial console.** To debug boot/early-startup problems, spin up an EC2 twin in
-   the **same region, same type, same Ubuntu** and use `Get system log` / `Get instance screenshot`;
-   `terminate` it when done — it costs cents.
-6. **Recreated instances**: for the same AMI the **filesystem UUIDs are unchanged**, but the **public
-   IP and SSH host key change**. A `~/.ssh/config` alias can stay fixed, but update the IP.
-7. **"Everything is a file" saves you a lot**: `/sys/class/net/*/device/{vendor,device,driver}`,
-   `/sys/firmware/efi`, `blkid`, `lsblk`, `efibootmgr`, `dmesg`, `lsmod` — read the real
-   hardware/layout first, **then act. Don't guess.**
-
----
-
-## 12. References
-
-- nixos-infect: <https://github.com/elitak/nixos-infect>
-- nixos-anywhere issue #139 (ENA/NVMe not re-initialized after Nitro kexec):
-  <https://github.com/nixos-anywhere/nixos-anywhere/issues/139>
-- nixpkgs `boot.initrd.systemd.enable` (default true):
-  `nixos/modules/system/boot/systemd/initrd.nix`
-- nixpkgs `lustrateRoot` (bash stage-1 only): `nixos/modules/system/boot/stage-1-init.sh`
-- NixOS manual: the `NIXOS_LUSTRATE` mechanism
+- [nixos-infect](https://github.com/elitak/nixos-infect)
+- [nixos-anywhere #139](https://github.com/nixos-anywhere/nixos-anywhere/issues/139)
+- `nixos/modules/system/boot/stage-1-init.sh` 的 `lustrateRoot`
