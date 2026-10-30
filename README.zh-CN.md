@@ -48,6 +48,9 @@ scp -i $KEY root@$IP:/etc/nixos/hardware.nix ./hosts/<名字>/hardware.nix
 脚本输出跟随系统语言：`LANG=zh_CN.UTF-8` 输出中文，其它一律英文。也可以在单次运行时用
 `--lang en` 或 `--lang zh` 指定。
 
+新开的云主机一般根本没有 `LANG`，`sudo` 还会把环境变量清掉，所以机器上默认是英文——
+想要中文直接加 `--lang zh`。
+
 ```
 $ LANG=zh_CN.UTF-8 sudo bash lightsail-to-nixos.sh --dry-run
 === 探测结果

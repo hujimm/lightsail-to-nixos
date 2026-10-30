@@ -50,6 +50,9 @@ then waits for you to run `sudo systemctl reboot`.
 Command output follows the locale: `LANG=zh_CN.UTF-8` prints Chinese, anything else prints
 English. Override per run with `--lang en` or `--lang zh`.
 
+A freshly launched cloud instance usually has no `LANG` at all, and `sudo` drops it anyway, so
+the default on the server is English — pass `--lang zh` if you want Chinese.
+
 ```
 $ LANG=zh_CN.UTF-8 sudo bash lightsail-to-nixos.sh --dry-run
 === 探测结果
