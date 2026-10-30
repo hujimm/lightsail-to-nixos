@@ -40,6 +40,9 @@ ssh -i $KEY root@$IP '/etc/nixos/lightsail-to-nixos.sh --cleanup'
 scp -i $KEY root@$IP:/etc/nixos/hardware.nix ./hosts/<名字>/hardware.nix
 ```
 
+脚本输出跟随系统语言（`LANG=zh_CN.UTF-8` 自动用中文），也可以用 `--lang en|zh` 指定；
+脚本注释和生成的 Nix 配置固定英文，避免同一个文件里两种语言混着。
+
 想截图或分步看，第 3 步加 `--no-reboot`：脚本会打印探测结果、四项核对和三段 UUID，
 然后停下等你自己 `sudo systemctl reboot`。
 
