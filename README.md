@@ -41,13 +41,38 @@ ssh -i $KEY root@$IP '/etc/nixos/lightsail-to-nixos.sh --cleanup'
 scp -i $KEY root@$IP:/etc/nixos/hardware.nix ./hosts/<name>/hardware.nix
 ```
 
-Messages follow your locale (`LANG=zh_CN.UTF-8` prints Chinese); override with `--lang en|zh`.
-The script's comments and the generated Nix files are English, so a single file is not
-half-translated.
-
 If you want screenshots or a manual step in between, add `--no-reboot` to step 3.
 The script prints the detected layout, the four pre-reboot checks and the UUIDs,
 then waits for you to run `sudo systemctl reboot`.
+
+## Language
+
+Command output follows the locale: `LANG=zh_CN.UTF-8` prints Chinese, anything else prints
+English. Override per run with `--lang en` or `--lang zh`.
+
+```
+$ LANG=zh_CN.UTF-8 sudo bash lightsail-to-nixos.sh --dry-run
+=== 探测结果
+根分区   /dev/nvme0n1p1  ext4  UUID=d662a37e-...
+/boot      UUID=71a1f8dc-...  ext4
+ESP        /boot/efi  UUID=876F-1C6F
+
+$ sudo bash lightsail-to-nixos.sh --lang en --dry-run
+=== detected layout
+root       /dev/nvme0n1p1  ext4  UUID=d662a37e-...
+/boot      UUID=71a1f8dc-...  ext4
+ESP        /boot/efi  UUID=876F-1C6F
+```
+
+Two things stay English on purpose:
+
+- **the script's comments**, so the source reads the same for everyone;
+- **the generated `configuration.nix` and `hardware.nix`**, because a config file should not
+  change language depending on who happened to run the installer, and those comments are read
+  later by whoever maintains the machine.
+
+Paths and commands inside the messages are never translated, so you can copy them between
+languages.
 
 ## What the script does
 

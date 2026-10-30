@@ -40,11 +40,35 @@ ssh -i $KEY root@$IP '/etc/nixos/lightsail-to-nixos.sh --cleanup'
 scp -i $KEY root@$IP:/etc/nixos/hardware.nix ./hosts/<名字>/hardware.nix
 ```
 
-脚本输出跟随系统语言（`LANG=zh_CN.UTF-8` 自动用中文），也可以用 `--lang en|zh` 指定；
-脚本注释和生成的 Nix 配置固定英文，避免同一个文件里两种语言混着。
-
 想截图或分步看，第 3 步加 `--no-reboot`：脚本会打印探测结果、四项核对和三段 UUID，
 然后停下等你自己 `sudo systemctl reboot`。
+
+## 语言
+
+脚本输出跟随系统语言：`LANG=zh_CN.UTF-8` 输出中文，其它一律英文。也可以在单次运行时用
+`--lang en` 或 `--lang zh` 指定。
+
+```
+$ LANG=zh_CN.UTF-8 sudo bash lightsail-to-nixos.sh --dry-run
+=== 探测结果
+根分区   /dev/nvme0n1p1  ext4  UUID=d662a37e-...
+/boot      UUID=71a1f8dc-...  ext4
+ESP        /boot/efi  UUID=876F-1C6F
+
+$ sudo bash lightsail-to-nixos.sh --lang en --dry-run
+=== detected layout
+root       /dev/nvme0n1p1  ext4  UUID=d662a37e-...
+/boot      UUID=71a1f8dc-...  ext4
+ESP        /boot/efi  UUID=876F-1C6F
+```
+
+有两样东西固定英文，是有意的：
+
+- **脚本注释**：源码只保留一种语言，谁读都一样；
+- **生成的 `configuration.nix` 与 `hardware.nix`**：配置文件不该因为「当初是谁跑的安装脚本」
+  而换语言，里面的注释是给以后维护这台机器的人看的。
+
+提示语里的路径和命令不翻译，两种语言下都能直接复制执行。
 
 ## 脚本做了什么
 
